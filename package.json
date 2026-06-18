@@ -1,0 +1,26 @@
+{
+    "name": "projeto-administrativo-financeiro",
+    "version": "1.0.0",
+    "description": "Projeto Administrativo-Financeiro — Etapa 2 (N2) Universidade de Rio Verde — 2026",
+    "main": "index.js",
+    "scripts": {
+        "dev:front": "vite",
+        "dev:api": ".\\.venv\\Scripts\\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload",
+        "db:start": "docker-compose up -d",
+        "db:stop": "docker-compose down",
+        "db:logs": "docker-compose logs -f postgres",
+        "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "type": "commonjs",
+    "dependencies": {
+        "react": "^19.2.5",
+        "react-dom": "^19.2.5"
+    },
+    "devDependencies": {
+        "vite": "^5.0.0",
+        "@vitejs/plugin-react": "^4.0.0"
+    }
+}
