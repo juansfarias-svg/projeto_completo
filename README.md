@@ -218,6 +218,37 @@ npm install
 npm run dev
 ```
 
+## Deploy
+
+### Frontend (Vercel)
+
+- Configure o projeto no Vercel apontando para este repositório.
+- Defina a variável de ambiente `VITE_API_URL` para a URL do backend Render.
+- Uses these settings:
+
+```json
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "framework": "vite",
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}
+```
+
+### Backend (Render)
+
+- Use o `Dockerfile` existente para o serviço Python.
+- Defina as variáveis de ambiente necessárias: `GROQ_API_KEY`, `DATABASE_URL`, `APP_USERNAME`, `APP_PASSWORD`, `SECRET_KEY`, `ALLOWED_ORIGINS`, `EMBEDDINGS_CACHE_PATH`.
+- Configure o banco PostgreSQL no Render e use a URL gerada em `DATABASE_URL`.
+
+### Backend alternativo (PythonAnywhere)
+
+- PythonAnywhere pode ser usado apenas se suportar ASGI/uvicorn no plano ou em beta.
+- A aplicação FastAPI está pronta para rodar como `uvicorn main:app --host 0.0.0.0 --port 8000`.
+- Use `ALLOWED_ORIGINS` para permitir a URL do frontend.
+
 Frontend: http://localhost:5173
 
 ---

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
@@ -8,7 +8,10 @@ import psycopg2.extras
 import json
 import os
 import tempfile
+import base64
 import hashlib
+import hmac
+import time
 from dotenv import load_dotenv
 from datetime import date
 
@@ -36,13 +39,71 @@ app.add_middleware(
 # ============================================================
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://financeiro:financeiro123@localhost:5432/financeiro")
+APP_USERNAME = os.getenv("APP_USERNAME", "admin")
+APP_PASSWORD = os.getenv("APP_PASSWORD", "admin123")
+SECRET_KEY = os.getenv("SECRET_KEY", "troque-esta-chave-em-producao-unirv-2026")
+TOKEN_TTL_SEGUNDOS = 60 * 60 * 8
 
 if not GROQ_API_KEY:
     print("[ERRO] GROQ_API_KEY nao encontrada")
 else:
     print("[OK] GROQ API OK")
 
+
+def _gerar_token(usuario: str) -> str:
+    expira = int(time.time()) + TOKEN_TTL_SEGUNDOS
+    payload = f"{usuario}|{expira}"
+    assinatura = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    token = f"{usuario}|{expira}|{assinatura}"
+    return base64.urlsafe_b64encode(token.encode()).decode().rstrip("=")
+
+
+def _validar_token(token: str) -> bool:
+    if not token:
+        return False
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        decoded = base64.urlsafe_b64decode(padded.encode()).decode()
+        usuario, expira, assinatura = decoded.split("|")
+        payload = f"{usuario}|{expira}"
+        expected = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, assinatura):
+            return False
+        if int(expira) < int(time.time()):
+            return False
+        return True
+    except Exception:
+        return False
+
 client = Groq(api_key=GROQ_API_KEY)
+
+# ============================================================
+# AUTENTICAÇÃO SIMPLES (token assinado, sem banco de usuários)
+# ============================================================
+class LoginPayload(BaseModel):
+    usuario: str
+    senha: str
+
+
+@app.post("/login")
+def login(payload: LoginPayload):
+    """Autentica usuário com credenciais fixas (via .env) e retorna um token."""
+    if payload.usuario.strip() == APP_USERNAME and payload.senha == APP_PASSWORD:
+        token = _gerar_token(payload.usuario)
+        return {"success": True, "token": token, "usuario": payload.usuario}
+    raise HTTPException(401, "Usuário ou senha inválidos")
+
+
+@app.get("/login/verificar")
+def verificar_login(authorization: str = Header(None)):
+    """Verifica se o token no header é válido."""
+    if not authorization:
+        raise HTTPException(401, "Token não fornecido")
+    token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+    if _validar_token(token):
+        return {"success": True}
+    raise HTTPException(401, "Token inválido ou expirado")
+
 
 # ============================================================
 # BANCO DE DADOS
@@ -632,3 +693,298 @@ def reindexar_embeddings():
         import traceback
         traceback.print_exc()
         raise HTTPException(500, f"Erro ao reindexar: {e}")
+
+
+# ============================================================
+# ETAPA 4 — CRUD: MANTER ENTIDADES
+# ============================================================
+
+# ── helpers ──────────────────────────────────────────────────
+def _rows_to_list(cur) -> list:
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+def _serialize(obj):
+    from decimal import Decimal
+    from datetime import date, datetime
+    if isinstance(obj, Decimal): return float(obj)
+    if isinstance(obj, (date, datetime)): return obj.isoformat()
+    return obj
+
+def _clean(rows: list) -> list:
+    return [{k: _serialize(v) for k, v in r.items()} for r in rows]
+
+class ApiKey(BaseModel):
+    groq_api_key: str
+
+# ── configuração de chave em runtime ─────────────────────────
+@app.post("/config/api-key")
+def set_api_key(payload: ApiKey):
+    """Permite configurar a GROQ_API_KEY sem reiniciar o servidor."""
+    global GROQ_API_KEY, client
+    key = payload.groq_api_key.strip()
+    if not key:
+        raise HTTPException(400, "Chave inválida")
+    GROQ_API_KEY = key
+    client = Groq(api_key=key)
+    return {"success": True, "mensagem": "Chave configurada com sucesso"}
+
+@app.get("/config/api-key-status")
+def api_key_status():
+    return {"configurada": bool(GROQ_API_KEY)}
+
+# ── FORNECEDOR ────────────────────────────────────────────────
+class FornecedorPayload(BaseModel):
+    razao_social: str
+    fantasia: str | None = None
+    cnpj: str
+
+@app.get("/fornecedores")
+def listar_fornecedores(busca: str = "", todos: bool = False):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        q = "SELECT id,razao_social,fantasia,cnpj,ativo,criado_em FROM fornecedor WHERE 1=1"
+        params = []
+        if not todos:
+            q += " AND ativo=TRUE"
+        if busca:
+            q += " AND (razao_social ILIKE %s OR fantasia ILIKE %s OR cnpj ILIKE %s)"
+            params += [f"%{busca}%"]*3
+        q += " ORDER BY razao_social"
+        cur.execute(q, params)
+        return {"data": _clean(_rows_to_list(cur))}
+    finally: cur.close(); conn.close()
+
+@app.post("/fornecedores")
+def criar_fornecedor(p: FornecedorPayload):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""INSERT INTO fornecedor (razao_social,fantasia,cnpj)
+            VALUES (%s,%s,%s) RETURNING id""", (p.razao_social, p.fantasia, p.cnpj))
+        conn.commit()
+        return {"success": True, "id": cur.fetchone()[0]}
+    except Exception as e:
+        conn.rollback(); raise HTTPException(400, str(e))
+    finally: cur.close(); conn.close()
+
+@app.put("/fornecedores/{id}")
+def editar_fornecedor(id: int, p: FornecedorPayload):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""UPDATE fornecedor SET razao_social=%s,fantasia=%s,cnpj=%s
+            WHERE id=%s""", (p.razao_social, p.fantasia, p.cnpj, id))
+        conn.commit(); return {"success": True}
+    except Exception as e:
+        conn.rollback(); raise HTTPException(400, str(e))
+    finally: cur.close(); conn.close()
+
+@app.patch("/fornecedores/{id}/status")
+def status_fornecedor(id: int, ativo: bool):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("UPDATE fornecedor SET ativo=%s WHERE id=%s", (ativo, id))
+        conn.commit(); return {"success": True}
+    finally: cur.close(); conn.close()
+
+# ── CLIENTE ───────────────────────────────────────────────────
+class ClientePayload(BaseModel):
+    razao_social: str
+    fantasia: str | None = None
+    cnpj: str | None = None
+    cpf: str | None = None
+
+@app.get("/clientes")
+def listar_clientes(busca: str = "", todos: bool = False):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        q = "SELECT id,razao_social,fantasia,cnpj,cpf,ativo,criado_em FROM cliente WHERE 1=1"
+        params = []
+        if not todos: q += " AND ativo=TRUE"
+        if busca:
+            q += " AND (razao_social ILIKE %s OR fantasia ILIKE %s OR cnpj ILIKE %s OR cpf ILIKE %s)"
+            params += [f"%{busca}%"]*4
+        q += " ORDER BY razao_social"
+        cur.execute(q, params)
+        return {"data": _clean(_rows_to_list(cur))}
+    finally: cur.close(); conn.close()
+
+@app.post("/clientes")
+def criar_cliente(p: ClientePayload):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""INSERT INTO cliente (razao_social,fantasia,cnpj,cpf)
+            VALUES (%s,%s,%s,%s) RETURNING id""", (p.razao_social, p.fantasia, p.cnpj, p.cpf))
+        conn.commit(); return {"success": True, "id": cur.fetchone()[0]}
+    except Exception as e:
+        conn.rollback(); raise HTTPException(400, str(e))
+    finally: cur.close(); conn.close()
+
+@app.put("/clientes/{id}")
+def editar_cliente(id: int, p: ClientePayload):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""UPDATE cliente SET razao_social=%s,fantasia=%s,cnpj=%s,cpf=%s
+            WHERE id=%s""", (p.razao_social, p.fantasia, p.cnpj, p.cpf, id))
+        conn.commit(); return {"success": True}
+    except Exception as e:
+        conn.rollback(); raise HTTPException(400, str(e))
+    finally: cur.close(); conn.close()
+
+@app.patch("/clientes/{id}/status")
+def status_cliente(id: int, ativo: bool):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("UPDATE cliente SET ativo=%s WHERE id=%s", (ativo, id))
+        conn.commit(); return {"success": True}
+    finally: cur.close(); conn.close()
+
+# ── FATURADO ─────────────────────────────────────────────────
+class FaturadoPayload(BaseModel):
+    nome_completo: str
+    cpf: str | None = None
+
+@app.get("/faturados")
+def listar_faturados(busca: str = "", todos: bool = False):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        q = "SELECT id,nome_completo,cpf,ativo,criado_em FROM faturado WHERE 1=1"
+        params = []
+        if not todos: q += " AND ativo=TRUE"
+        if busca:
+            q += " AND (nome_completo ILIKE %s OR cpf ILIKE %s)"
+            params += [f"%{busca}%"]*2
+        q += " ORDER BY nome_completo"
+        cur.execute(q, params)
+        return {"data": _clean(_rows_to_list(cur))}
+    finally: cur.close(); conn.close()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+@app.post("/faturados")
+def criar_faturado(p: FaturadoPayload):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO faturado (nome_completo,cpf) VALUES (%s,%s) RETURNING id",
+            (p.nome_completo, p.cpf))
+        conn.commit(); return {"success": True, "id": cur.fetchone()[0]}
+    except Exception as e:
+        conn.rollback(); raise HTTPException(400, str(e))
+    finally: cur.close(); conn.close()
+
+@app.put("/faturados/{id}")
+def editar_faturado(id: int, p: FaturadoPayload):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("UPDATE faturado SET nome_completo=%s,cpf=%s WHERE id=%s",
+            (p.nome_completo, p.cpf, id))
+        conn.commit(); return {"success": True}
+    except Exception as e:
+        conn.rollback(); raise HTTPException(400, str(e))
+    finally: cur.close(); conn.close()
+
+@app.patch("/faturados/{id}/status")
+def status_faturado(id: int, ativo: bool):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("UPDATE faturado SET ativo=%s WHERE id=%s", (ativo, id))
+        conn.commit(); return {"success": True}
+    finally: cur.close(); conn.close()
+
+# ── TIPO DESPESA ─────────────────────────────────────────────
+class ClassificacaoPayload(BaseModel):
+    nome: str
+    descricao: str | None = None
+
+@app.get("/tipos-despesa")
+def listar_tipos_despesa(busca: str = "", todos: bool = False):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        q = "SELECT id,nome,descricao,ativo,criado_em FROM tipo_despesa WHERE 1=1"
+        params = []
+        if not todos: q += " AND ativo=TRUE"
+        if busca:
+            q += " AND (nome ILIKE %s OR descricao ILIKE %s)"
+            params += [f"%{busca}%"]*2
+        q += " ORDER BY nome"
+        cur.execute(q, params)
+        return {"data": _clean(_rows_to_list(cur))}
+    finally: cur.close(); conn.close()
+
+@app.post("/tipos-despesa")
+def criar_tipo_despesa(p: ClassificacaoPayload):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO tipo_despesa (nome,descricao) VALUES (%s,%s) RETURNING id",
+            (p.nome.upper(), p.descricao))
+        conn.commit(); return {"success": True, "id": cur.fetchone()[0]}
+    except Exception as e:
+        conn.rollback(); raise HTTPException(400, str(e))
+    finally: cur.close(); conn.close()
+
+@app.put("/tipos-despesa/{id}")
+def editar_tipo_despesa(id: int, p: ClassificacaoPayload):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("UPDATE tipo_despesa SET nome=%s,descricao=%s WHERE id=%s",
+            (p.nome.upper(), p.descricao, id))
+        conn.commit(); return {"success": True}
+    except Exception as e:
+        conn.rollback(); raise HTTPException(400, str(e))
+    finally: cur.close(); conn.close()
+
+@app.patch("/tipos-despesa/{id}/status")
+def status_tipo_despesa(id: int, ativo: bool):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("UPDATE tipo_despesa SET ativo=%s WHERE id=%s", (ativo, id))
+        conn.commit(); return {"success": True}
+    finally: cur.close(); conn.close()
+
+# ── TIPO RECEITA ─────────────────────────────────────────────
+@app.get("/tipos-receita")
+def listar_tipos_receita(busca: str = "", todos: bool = False):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        q = "SELECT id,nome,descricao,ativo,criado_em FROM tipo_receita WHERE 1=1"
+        params = []
+        if not todos: q += " AND ativo=TRUE"
+        if busca:
+            q += " AND (nome ILIKE %s OR descricao ILIKE %s)"
+            params += [f"%{busca}%"]*2
+        q += " ORDER BY nome"
+        cur.execute(q, params)
+        return {"data": _clean(_rows_to_list(cur))}
+    finally: cur.close(); conn.close()
+
+@app.post("/tipos-receita")
+def criar_tipo_receita(p: ClassificacaoPayload):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO tipo_receita (nome,descricao) VALUES (%s,%s) RETURNING id",
+            (p.nome.upper(), p.descricao))
+        conn.commit(); return {"success": True, "id": cur.fetchone()[0]}
+    except Exception as e:
+        conn.rollback(); raise HTTPException(400, str(e))
+    finally: cur.close(); conn.close()
+
+@app.put("/tipos-receita/{id}")
+def editar_tipo_receita(id: int, p: ClassificacaoPayload):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("UPDATE tipo_receita SET nome=%s,descricao=%s WHERE id=%s",
+            (p.nome.upper(), p.descricao, id))
+        conn.commit(); return {"success": True}
+    except Exception as e:
+        conn.rollback(); raise HTTPException(400, str(e))
+    finally: cur.close(); conn.close()
+
+@app.patch("/tipos-receita/{id}/status")
+def status_tipo_receita(id: int, ativo: bool):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("UPDATE tipo_receita SET ativo=%s WHERE id=%s", (ativo, id))
+        conn.commit(); return {"success": True}
+    finally: cur.close(); conn.close()

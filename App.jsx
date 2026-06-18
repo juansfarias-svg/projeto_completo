@@ -1,7 +1,25 @@
 import { useState, useRef, useEffect, useCallback } from "react"
 import "./App.css"
 
-const API_URL = "http://localhost:8000"
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000"
+const TOKEN_STORAGE_KEY = "nf_auth_token"
+
+async function authFetch(url, options = {}) {
+    const token = localStorage.getItem(TOKEN_STORAGE_KEY)
+    const headers = { ...(options.headers || {}) }
+    if (token) {
+        headers.Authorization = `Bearer ${token}`
+    }
+    const res = await fetch(url, { ...options, headers })
+    if (res.status === 401) {
+        const hadToken = Boolean(token)
+        localStorage.removeItem(TOKEN_STORAGE_KEY)
+        if (hadToken) {
+            window.location.reload()
+        }
+    }
+    return res
+}
 
 // ────────────────────────────────────────────────────────────
 // HELPERS DE FORMATAÇÃO
@@ -164,7 +182,7 @@ function HistoricoView({ dbStatus }) {
         setCarregando(true)
         setErro(null)
         try {
-            const res = await fetch(`${API_URL}/contas-a-pagar?limite=30&pagina=1`)
+            const res = await authFetch(`${API_URL}/contas-a-pagar?limite=30&pagina=1`)
             const json = await res.json()
             if (!res.ok) throw new Error(json.detail || "Erro ao buscar histórico")
             setHistorico(json.registros || [])
@@ -185,7 +203,7 @@ function HistoricoView({ dbStatus }) {
         setErro(null)
 
         try {
-            const res = await fetch(`${API_URL}/contas-a-pagar/${contaId}`, {
+            const res = await authFetch(`${API_URL}/contas-a-pagar/${contaId}`, {
                 method: "DELETE",
             })
             const json = await res.json()
@@ -209,7 +227,7 @@ function HistoricoView({ dbStatus }) {
         setErro(null)
 
         try {
-            const res = await fetch(`${API_URL}/contas-a-pagar`, {
+            const res = await authFetch(`${API_URL}/contas-a-pagar`, {
                 method: "DELETE",
             })
             const json = await res.json()
@@ -393,7 +411,7 @@ function AssistenteView({ dbStatus }) {
         setPergunta("")
 
         try {
-            const res = await fetch(`${API_URL}/perguntar`, {
+            const res = await authFetch(`${API_URL}/perguntar`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ pergunta: texto, modo })
@@ -426,7 +444,7 @@ function AssistenteView({ dbStatus }) {
         setReindexando(true)
         setReindexMsg(null)
         try {
-            const res = await fetch(`${API_URL}/perguntar/reindexar`, { method: "POST" })
+            const res = await authFetch(`${API_URL}/perguntar/reindexar`, { method: "POST" })
             const json = await res.json()
             if (!res.ok || !json.success) {
                 throw new Error(json.detail || json.error || "Erro ao reindexar.")
@@ -575,6 +593,412 @@ function AssistenteView({ dbStatus }) {
 }
 
 // ────────────────────────────────────────────────────────────
+// COMPONENTE GENÉRICO: TELA MANTER (CRUD com tabela + modal)
+// Usado por Fornecedor, Cliente, Faturado, Despesa, Receita
+// ────────────────────────────────────────────────────────────
+function ManterView({ config }) {
+    const { titulo, endpoint, colunas, campos, emptyMsg } = config
+    const [dados, setDados] = useState([])
+    const [busca, setBusca] = useState("")
+    const [todos, setTodos] = useState(false)
+    const [carregando, setCarregando] = useState(false)
+    const [modal, setModal] = useState(null) // null | { modo:"criar"|"editar", item?:obj }
+    const [form, setForm] = useState({})
+    const [salvando, setSalvando] = useState(false)
+    const [erro, setErro] = useState(null)
+    const [msg, setMsg] = useState(null)
+    const [sortCol, setSortCol] = useState(null)
+    const [sortAsc, setSortAsc] = useState(true)
+
+    const flash = (texto, tipo = "ok") => {
+        setMsg({ texto, tipo })
+        setTimeout(() => setMsg(null), 3500)
+    }
+
+    const carregar = useCallback(async (b = busca, t = todos) => {
+        setCarregando(true); setErro(null)
+        try {
+            const params = new URLSearchParams()
+            if (b) params.set("busca", b)
+            if (t) params.set("todos", "true")
+            const res = await authFetch(`${API_URL}/${endpoint}?${params}`)
+            const json = await res.json()
+            if (!res.ok) throw new Error(json.detail || "Erro ao carregar")
+            setDados(json.data || [])
+        } catch (e) { setErro(e.message) }
+        finally { setCarregando(false) }
+    }, [endpoint, busca, todos])
+
+    const abrirCriar = () => {
+        const vazio = {}
+        campos.forEach(c => vazio[c.key] = "")
+        setForm(vazio); setModal({ modo: "criar" })
+    }
+
+    const abrirEditar = (item) => {
+        const f = {}
+        campos.forEach(c => f[c.key] = item[c.key] ?? "")
+        setForm(f); setModal({ modo: "editar", item })
+    }
+
+    const salvar = async () => {
+        setSalvando(true)
+        try {
+            const isEditar = modal.modo === "editar"
+            const url = isEditar
+                ? `${API_URL}/${endpoint}/${modal.item.id}`
+                : `${API_URL}/${endpoint}`
+            const res = await authFetch(url, {
+                method: isEditar ? "PUT" : "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(form)
+            })
+            const json = await res.json()
+            if (!res.ok) throw new Error(json.detail || "Erro ao salvar")
+            setModal(null)
+            flash(isEditar ? "Registro atualizado!" : "Registro criado!")
+            carregar(busca, todos)
+        } catch (e) { flash(e.message, "erro") }
+        finally { setSalvando(false) }
+    }
+
+    const alterarStatus = async (item, ativo) => {
+        try {
+            const res = await authFetch(
+                `${API_URL}/${endpoint}/${item.id}/status?ativo=${ativo}`,
+                { method: "PATCH" }
+            )
+            if (!res.ok) throw new Error("Erro ao alterar status")
+            flash(ativo ? "Registro reativado!" : "Registro inativado!")
+            carregar(busca, todos)
+        } catch (e) { flash(e.message, "erro") }
+    }
+
+    const ordenar = (col) => {
+        if (sortCol === col) setSortAsc(!sortAsc)
+        else { setSortCol(col); setSortAsc(true) }
+    }
+
+    const dadosOrdenados = [...dados].sort((a, b) => {
+        if (!sortCol) return 0
+        const va = (a[sortCol] ?? "").toString().toLowerCase()
+        const vb = (b[sortCol] ?? "").toString().toLowerCase()
+        return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va)
+    })
+
+    return (
+        <div className="manter-wrapper">
+            {/* Toolbar */}
+            <div className="manter-toolbar">
+                <div className="manter-busca-group">
+                    <input
+                        className="manter-busca"
+                        placeholder="Buscar..."
+                        value={busca}
+                        onChange={e => setBusca(e.target.value)}
+                        onKeyDown={e => e.key === "Enter" && carregar(busca, todos)}
+                    />
+                    <button className="btn-buscar" onClick={() => carregar(busca, todos)}>
+                        Buscar
+                    </button>
+                    <button className="btn-todos" onClick={() => { const t = !todos; setTodos(t); carregar(busca, t) }}>
+                        {todos ? "Só Ativos" : "Todos"}
+                    </button>
+                </div>
+                <button className="btn-novo" onClick={abrirCriar}>+ Novo</button>
+            </div>
+
+            {/* Flash */}
+            {msg && <div className={`manter-flash manter-flash--${msg.tipo}`}>{msg.texto}</div>}
+            {erro && <div className="manter-flash manter-flash--erro">{erro}</div>}
+
+            {/* Tabela */}
+            <div className="manter-table-wrap">
+                {carregando ? (
+                    <div className="manter-loading"><span className="spinner" /> Carregando...</div>
+                ) : dadosOrdenados.length === 0 ? (
+                    <div className="manter-empty">{emptyMsg || "Nenhum registro. Clique em Buscar ou Todos."}</div>
+                ) : (
+                    <table className="manter-table">
+                        <thead>
+                            <tr>
+                                {colunas.map(col => (
+                                    <th key={col.key} onClick={() => ordenar(col.key)} className="sortable">
+                                        {col.label}
+                                        {sortCol === col.key && <span>{sortAsc ? " ↑" : " ↓"}</span>}
+                                    </th>
+                                ))}
+                                <th>Status</th>
+                                <th>Ações</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {dadosOrdenados.map(item => (
+                                <tr key={item.id} className={!item.ativo ? "row-inativo" : ""}>
+                                    {colunas.map(col => (
+                                        <td key={col.key}>{item[col.key] ?? "—"}</td>
+                                    ))}
+                                    <td>
+                                        <span className={`status-badge ${item.ativo ? "ativo" : "inativo"}`}>
+                                            {item.ativo ? "Ativo" : "Inativo"}
+                                        </span>
+                                    </td>
+                                    <td className="acoes-cell">
+                                        <button className="btn-acao btn-editar" onClick={() => abrirEditar(item)}>
+                                            Editar
+                                        </button>
+                                        {item.ativo ? (
+                                            <button className="btn-acao btn-inativar" onClick={() => alterarStatus(item, false)}>
+                                                Inativar
+                                            </button>
+                                        ) : (
+                                            <button className="btn-acao btn-reativar" onClick={() => alterarStatus(item, true)}>
+                                                Reativar
+                                            </button>
+                                        )}
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                )}
+            </div>
+
+            {/* Modal */}
+            {modal && (
+                <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setModal(null)}>
+                    <div className="modal-box">
+                        <div className="modal-header">
+                            <h3>{modal.modo === "criar" ? `Novo ${titulo}` : `Editar ${titulo}`}</h3>
+                            <button className="modal-close" onClick={() => setModal(null)}>✕</button>
+                        </div>
+                        <div className="modal-body">
+                            {campos.map(campo => (
+                                <div key={campo.key} className="modal-field">
+                                    <label>{campo.label}{campo.obrigatorio && " *"}</label>
+                                    <input
+                                        type={campo.type || "text"}
+                                        placeholder={campo.placeholder || ""}
+                                        value={form[campo.key] ?? ""}
+                                        onChange={e => setForm(f => ({ ...f, [campo.key]: e.target.value }))}
+                                    />
+                                </div>
+                            ))}
+                        </div>
+                        <div className="modal-footer">
+                            <button className="btn-cancelar" onClick={() => setModal(null)}>Cancelar</button>
+                            <button className="btn-salvar" onClick={salvar} disabled={salvando}>
+                                {salvando ? <><span className="spinner" /> Salvando...</> : "Salvar"}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+    )
+}
+
+// ────────────────────────────────────────────────────────────
+// CONFIGS DAS TELAS MANTER
+// ────────────────────────────────────────────────────────────
+const CONFIG_FORNECEDOR = {
+    titulo: "Fornecedor", endpoint: "fornecedores",
+    colunas: [
+        { key: "id", label: "ID" },
+        { key: "razao_social", label: "Razão Social" },
+        { key: "fantasia", label: "Fantasia" },
+        { key: "cnpj", label: "CNPJ" },
+    ],
+    campos: [
+        { key: "razao_social", label: "Razão Social", obrigatorio: true, placeholder: "Nome da empresa" },
+        { key: "fantasia", label: "Nome Fantasia", placeholder: "Nome fantasia (opcional)" },
+        { key: "cnpj", label: "CNPJ", obrigatorio: true, placeholder: "XX.XXX.XXX/XXXX-XX" },
+    ],
+}
+
+const CONFIG_CLIENTE = {
+    titulo: "Cliente", endpoint: "clientes",
+    colunas: [
+        { key: "id", label: "ID" },
+        { key: "razao_social", label: "Razão Social / Nome" },
+        { key: "fantasia", label: "Fantasia" },
+        { key: "cnpj", label: "CNPJ" },
+        { key: "cpf", label: "CPF" },
+    ],
+    campos: [
+        { key: "razao_social", label: "Razão Social / Nome", obrigatorio: true, placeholder: "Nome ou razão social" },
+        { key: "fantasia", label: "Nome Fantasia", placeholder: "Opcional" },
+        { key: "cnpj", label: "CNPJ", placeholder: "XX.XXX.XXX/XXXX-XX (PJ)" },
+        { key: "cpf", label: "CPF", placeholder: "XXX.XXX.XXX-XX (PF)" },
+    ],
+}
+
+const CONFIG_FATURADO = {
+    titulo: "Faturado", endpoint: "faturados",
+    colunas: [
+        { key: "id", label: "ID" },
+        { key: "nome_completo", label: "Nome Completo" },
+        { key: "cpf", label: "CPF" },
+    ],
+    campos: [
+        { key: "nome_completo", label: "Nome Completo", obrigatorio: true, placeholder: "Nome completo da pessoa" },
+        { key: "cpf", label: "CPF", placeholder: "XXX.XXX.XXX-XX (opcional)" },
+    ],
+}
+
+const CONFIG_DESPESA = {
+    titulo: "Tipo de Despesa", endpoint: "tipos-despesa",
+    colunas: [
+        { key: "id", label: "ID" },
+        { key: "nome", label: "Nome" },
+        { key: "descricao", label: "Descrição" },
+    ],
+    campos: [
+        { key: "nome", label: "Nome da Categoria", obrigatorio: true, placeholder: "Ex: INSUMOS AGRÍCOLAS" },
+        { key: "descricao", label: "Descrição", placeholder: "Itens que se enquadram nessa categoria" },
+    ],
+}
+
+const CONFIG_RECEITA = {
+    titulo: "Tipo de Receita", endpoint: "tipos-receita",
+    colunas: [
+        { key: "id", label: "ID" },
+        { key: "nome", label: "Nome" },
+        { key: "descricao", label: "Descrição" },
+    ],
+    campos: [
+        { key: "nome", label: "Nome da Categoria", obrigatorio: true, placeholder: "Ex: VENDA DE PRODUTOS" },
+        { key: "descricao", label: "Descrição", placeholder: "Itens que se enquadram nessa categoria" },
+    ],
+}
+
+function LoginView({ onAutenticado, verificando }) {
+    const [usuario, setUsuario] = useState("")
+    const [senha, setSenha] = useState("")
+    const [loading, setLoading] = useState(false)
+    const [erro, setErro] = useState(null)
+
+    const handleLogin = async () => {
+        if (!usuario.trim() || !senha.trim()) return
+        setLoading(true)
+        setErro(null)
+
+        try {
+            const res = await fetch(`${API_URL}/login`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ usuario, senha })
+            })
+            const json = await res.json()
+            if (!res.ok) throw new Error(json.detail || json.error || "Usuário ou senha inválidos")
+            localStorage.setItem(TOKEN_STORAGE_KEY, json.token)
+            onAutenticado()
+        } catch (e) {
+            setErro(e.message)
+        } finally {
+            setLoading(false)
+        }
+    }
+
+    return (
+        <div className="login-view">
+            <div className="login-card">
+                <div className="login-icon">🔒</div>
+                <h2>{verificando ? "Verificando sessão..." : "Login"}</h2>
+                <p>{verificando ? "Aguarde enquanto validamos seu token." : "Faça login para acessar o sistema."}</p>
+                {verificando ? (
+                    <div className="login-spinner" />
+                ) : (
+                    <>
+                        <div className="login-field">
+                            <input
+                                type="text"
+                                placeholder="Usuário"
+                                value={usuario}
+                                onChange={(e) => setUsuario(e.target.value)}
+                                onKeyDown={(e) => e.key === "Enter" && handleLogin()}
+                            />
+                        </div>
+                        <div className="login-field">
+                            <input
+                                type="password"
+                                placeholder="Senha"
+                                value={senha}
+                                onChange={(e) => setSenha(e.target.value)}
+                                onKeyDown={(e) => e.key === "Enter" && handleLogin()}
+                            />
+                        </div>
+                        {erro && <div className="config-msg config-msg--erro">{erro}</div>}
+                        <button className="login-btn" onClick={handleLogin} disabled={loading || !usuario.trim() || !senha.trim()}>
+                            {loading ? "Entrando..." : "Entrar"}
+                        </button>
+                    </>
+                )}
+            </div>
+        </div>
+    )
+}
+
+// ────────────────────────────────────────────────────────────
+// TELA DE CONFIGURAÇÃO DE CHAVE API
+// ────────────────────────────────────────────────────────────
+function ConfigView({ onConfigurada }) {
+    const [chave, setChave] = useState("")
+    const [salvando, setSalvando] = useState(false)
+    const [msg, setMsg] = useState(null)
+
+    const salvar = async () => {
+        if (!chave.trim()) return
+        setSalvando(true); setMsg(null)
+        try {
+            const res = await authFetch(`${API_URL}/config/api-key`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ groq_api_key: chave.trim() })
+            })
+            const json = await res.json()
+            if (!res.ok) throw new Error(json.detail || "Erro ao configurar")
+            setMsg({ tipo: "ok", texto: "Chave configurada com sucesso!" })
+            setTimeout(() => onConfigurada && onConfigurada(), 1200)
+        } catch (e) {
+            setMsg({ tipo: "erro", texto: e.message })
+        } finally { setSalvando(false) }
+    }
+
+    return (
+        <div className="config-view">
+            <div className="config-card">
+                <div className="config-icon">🔑</div>
+                <h2>Configurar Chave da IA</h2>
+                <p>
+                    Para usar o Extrator de NF e o Assistente IA, informe sua chave da API Groq.<br />
+                    A chave é configurada apenas em memória e <strong>não é armazenada no servidor</strong>.
+                </p>
+                <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer" className="config-link">
+                    → Obter chave gratuita em console.groq.com
+                </a>
+                <div className="config-field">
+                    <input
+                        type="password"
+                        placeholder="gsk_..."
+                        value={chave}
+                        onChange={e => setChave(e.target.value)}
+                        onKeyDown={e => e.key === "Enter" && salvar()}
+                    />
+                    <button onClick={salvar} disabled={salvando || !chave.trim()}>
+                        {salvando ? <><span className="spinner" /> Salvando...</> : "Confirmar"}
+                    </button>
+                </div>
+                {msg && <div className={`config-msg config-msg--${msg.tipo}`}>{msg.texto}</div>}
+                <button className="config-skip" onClick={() => onConfigurada && onConfigurada()}>
+                    Pular por agora (usar variável de ambiente)
+                </button>
+            </div>
+        </div>
+    )
+}
+
+// ────────────────────────────────────────────────────────────
 // COMPONENTE PRINCIPAL
 // ────────────────────────────────────────────────────────────
 export default function App() {
@@ -586,18 +1010,56 @@ export default function App() {
     const [mainTab, setMainTab] = useState("extrator")
     const [dragOver, setDragOver] = useState(false)
     const [saving, setSaving] = useState(false)
-    const [saveStatus, setSaveStatus] = useState(null) // null | "ok" | "error"
+    const [saveStatus, setSaveStatus] = useState(null)
     const [saveMsg, setSaveMsg] = useState("")
     const [dbStatus, setDbStatus] = useState(null)
+    const [apiConfigurada, setApiConfigurada] = useState(null) // null=checando, true, false
+    const [autenticado, setAutenticado] = useState(null) // null=checando, true, false
     const inputRef = useRef()
 
-    // Checar status do banco ao carregar
     useEffect(() => {
-        fetch(`${API_URL}/db-status`)
+        const verificarLogin = async () => {
+            const token = localStorage.getItem(TOKEN_STORAGE_KEY)
+            if (!token) {
+                setAutenticado(false)
+                return
+            }
+            try {
+                const res = await authFetch(`${API_URL}/login/verificar`)
+                if (!res.ok) {
+                    setAutenticado(false)
+                    return
+                }
+                const json = await res.json()
+                setAutenticado(json.success === true)
+            } catch (e) {
+                setAutenticado(false)
+            }
+        }
+        verificarLogin()
+    }, [])
+
+    useEffect(() => {
+        if (autenticado !== true) return
+
+        authFetch(`${API_URL}/db-status`)
             .then(r => r.json())
             .then(j => setDbStatus(j.banco_disponivel))
             .catch(() => setDbStatus(false))
-    }, [])
+        // Verifica se a chave já está configurada (via env var)
+        authFetch(`${API_URL}/config/api-key-status`)
+            .then(r => r.json())
+            .then(j => setApiConfigurada(j.configurada))
+            .catch(() => setApiConfigurada(false))
+    }, [autenticado])
+
+    if (autenticado === null) {
+        return <LoginView verificando onAutenticado={() => setAutenticado(true)} />
+    }
+
+    if (autenticado === false) {
+        return <LoginView onAutenticado={() => setAutenticado(true)} />
+    }
 
     const handleFile = (f) => {
         if (f && f.type === "application/pdf") {
@@ -627,7 +1089,7 @@ export default function App() {
         formData.append("file", file)
 
         try {
-            const res = await fetch(`${API_URL}/extrair`, { method: "POST", body: formData })
+            const res = await authFetch(`${API_URL}/extrair`, { method: "POST", body: formData })
             const contentType = res.headers.get("content-type")
             if (!contentType?.includes("application/json")) {
                 const text = await res.text()
@@ -651,7 +1113,7 @@ export default function App() {
         setSaveStatus(null)
         setSaveMsg("")
         try {
-            const res = await fetch(`${API_URL}/salvar`, {
+            const res = await authFetch(`${API_URL}/salvar`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(result)
@@ -672,6 +1134,11 @@ export default function App() {
     return (
         <div className="app">
             <div className="bg-grid" />
+
+            {/* Tela de configuração de chave API (abre se não configurada) */}
+            {apiConfigurada === false && (
+                <ConfigView onConfigurada={() => setApiConfigurada(true)} />
+            )}
 
             <div className="container">
                 {/* Header */}
@@ -725,6 +1192,24 @@ export default function App() {
                         </svg>
                         Assistente IA
                         {!dbStatus && <span className="tab-badge-off">offline</span>}
+                    </button>
+                    <button className={`main-tab-btn ${mainTab === "fornecedores" ? "active" : ""}`} onClick={() => setMainTab("fornecedores")}>
+                        🏢 Fornecedores
+                    </button>
+                    <button className={`main-tab-btn ${mainTab === "clientes" ? "active" : ""}`} onClick={() => setMainTab("clientes")}>
+                        👥 Clientes
+                    </button>
+                    <button className={`main-tab-btn ${mainTab === "faturados" ? "active" : ""}`} onClick={() => setMainTab("faturados")}>
+                        👤 Faturados
+                    </button>
+                    <button className={`main-tab-btn ${mainTab === "despesas" ? "active" : ""}`} onClick={() => setMainTab("despesas")}>
+                        📋 Despesas
+                    </button>
+                    <button className={`main-tab-btn ${mainTab === "receitas" ? "active" : ""}`} onClick={() => setMainTab("receitas")}>
+                        💰 Receitas
+                    </button>
+                    <button className={`main-tab-btn ${mainTab === "config" ? "active" : ""}`} onClick={() => setMainTab("config")} title="Configurar chave da IA">
+                        ⚙ Config
                     </button>
                 </div>
 
@@ -900,6 +1385,54 @@ export default function App() {
                             Pergunte algo sobre suas contas, fornecedores, clientes ou despesas em linguagem natural.
                         </p>
                         <AssistenteView dbStatus={dbStatus} />
+                    </div>
+                )}
+
+                {/* ── MANTER FORNECEDORES ── */}
+                {mainTab === "fornecedores" && (
+                    <div className="card">
+                        <div className="card-label">🏢 Manter Fornecedores</div>
+                        <ManterView config={CONFIG_FORNECEDOR} />
+                    </div>
+                )}
+
+                {/* ── MANTER CLIENTES ── */}
+                {mainTab === "clientes" && (
+                    <div className="card">
+                        <div className="card-label">👥 Manter Clientes</div>
+                        <ManterView config={CONFIG_CLIENTE} />
+                    </div>
+                )}
+
+                {/* ── MANTER FATURADOS ── */}
+                {mainTab === "faturados" && (
+                    <div className="card">
+                        <div className="card-label">👤 Manter Faturados</div>
+                        <ManterView config={CONFIG_FATURADO} />
+                    </div>
+                )}
+
+                {/* ── MANTER TIPOS DESPESA ── */}
+                {mainTab === "despesas" && (
+                    <div className="card">
+                        <div className="card-label">📋 Manter Classificação de Despesa</div>
+                        <ManterView config={CONFIG_DESPESA} />
+                    </div>
+                )}
+
+                {/* ── MANTER TIPOS RECEITA ── */}
+                {mainTab === "receitas" && (
+                    <div className="card">
+                        <div className="card-label">💰 Manter Classificação de Receita</div>
+                        <ManterView config={CONFIG_RECEITA} />
+                    </div>
+                )}
+
+                {/* ── CONFIG CHAVE API ── */}
+                {mainTab === "config" && (
+                    <div className="card">
+                        <div className="card-label">⚙ Configurações</div>
+                        <ConfigView onConfigurada={() => setApiConfigurada(true)} />
                     </div>
                 )}
             </div>
