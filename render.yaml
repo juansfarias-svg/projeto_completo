@@ -12,13 +12,13 @@ services:
           name: extrator-nf-db
           property: connectionString
       - key: APP_USERNAME
-        sync: false
+        value: admin
       - key: APP_PASSWORD
         sync: false
       - key: SECRET_KEY
         generateValue: true
       - key: ALLOWED_ORIGINS
-        sync: false
+        value: https://projeto-completo-cyan.vercel.app
       - key: EMBEDDINGS_CACHE_PATH
         value: /app/data/embeddings_cache.pkl
     disk:
@@ -31,3 +31,4 @@ databases:
     plan: free
     databaseName: financeiro
     user: financeiro
+    ipAllowList: []
