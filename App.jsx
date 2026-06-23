@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react"
 import "./App.css"
 
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000"
+const API_URL = import.meta.env.VITE_API_URL || "https://projeto-completo-1.onrender.com"
 const TOKEN_STORAGE_KEY = "nf_auth_token"
 
 async function authFetch(url, options = {}) {
